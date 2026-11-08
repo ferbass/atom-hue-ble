@@ -1,44 +1,87 @@
 # atom-hue-ble
 
-Turns an M5Stack ATOM Lite into a one-button remote for a Philips Hue Bluetooth bulb.
-Press the button, the light toggles. It talks to the bulb directly over BLE, so there is
-no Hue Bridge and no Wi-Fi involved.
+Turns an M5Stack ATOM Lite or CoreInk into a one-button remote for a Philips Hue Bluetooth
+bulb. Press the button, the light toggles. Double-click, and it switches to your favourite
+look. It talks to the bulb directly over BLE, so there is no Hue Bridge and no Wi-Fi involved.
 
-Tested with an ATOM Lite and a single Hue bulb.
+Tested with an ATOM Lite and a single Hue bulb. The CoreInk build and the low-power mode
+build cleanly but have not been tested on hardware yet.
+
+## Builds
+
+| Environment | Board | Behaviour |
+| --- | --- | --- |
+| `m5stack-atom` (default) | ATOM Lite | Stays connected. Instant toggle, but drains a battery in hours. |
+| `m5stack-atom-lowpower` | ATOM Lite | Deep sleeps between presses. |
+| `m5stack-coreink` | CoreInk | Deep sleeps between presses, shows the state on the e-ink screen. |
+| `debug-dump` | ATOM Lite | Prints the bulb's GATT table after connecting. |
+
+In low-power builds a press wakes the board. It reconnects to the bulb, runs the action and
+stays awake for 5 seconds so quick follow-up presses are instant, then goes back to sleep.
+A press takes about 1 to 3 seconds to reach the light, in exchange for battery life measured
+in weeks instead of hours (estimated, not measured yet). As a bonus, the bulb is free for the Hue app while the board sleeps.
+
+If the bulb cannot be reached within 25 seconds, the board gives up and sleeps
+(ATOM: three red flashes, CoreInk: "No bulb"). Press again to retry. Pairing mode gives up
+after 3 minutes the same way.
+
+On the ATOM Lite the RGB LED still draws around 1 mA while dark, so sleep current is not
+as low as the ESP32 alone. The CoreInk is the better choice for battery use.
 
 ## Build and flash
 
 You need [PlatformIO](https://platformio.org/install/cli).
 
 ```bash
-pio run -t upload
+pio run -t upload                              # ATOM Lite, always connected
+pio run -e m5stack-atom-lowpower -t upload     # ATOM Lite, low power
+pio run -e m5stack-coreink -t upload           # CoreInk
 pio device monitor
 ```
+
+On battery, press the CoreInk's power button once to start it. After that the firmware keeps
+it powered and sleeps between presses.
 
 ## Pairing
 
 The bulb only bonds with a new device while it is in pairing mode, and it only holds about
 one BLE connection at a time. So the order matters:
 
-1. Flash the ATOM. With no bulb saved, the LED blinks blue and it starts scanning.
+1. Flash the board. With no bulb saved, it starts scanning (ATOM: LED blinks blue,
+   CoreInk: "Pairing" on screen).
 2. In the Hue app go to Settings → Voice assistants, pick Amazon Alexa or Google Home, and
    tap **Make visible**.
 3. Close the Hue app (or turn off Bluetooth on the phone) so the bulb is free.
-4. Wait. The ATOM picks the Hue bulb with the strongest signal, bonds, and stores its address.
-   The LED goes solid when it is done.
+4. Wait. The board picks the Hue bulb with the strongest signal, bonds, and stores its
+   address. The ATOM LED goes solid, or the CoreInk shows ON/OFF, when it is done.
 
-The visible window only lasts a minute or so. If you miss it, tap Make visible again; the ATOM
+The visible window only lasts a minute or so. If you miss it, tap Make visible again; the board
 keeps retrying on its own.
 
 From then on it connects straight to the saved bulb at boot.
 
 ## Using it
 
-- Press: toggle the light. If the bulb is not connected, a press retries the connection right away.
-- Hold for 5 seconds: forget the bulb, delete the bond and restart into pairing mode. The LED
-  flashes purple. The light also toggles once, because the toggle fires on press.
+ATOM Lite (the only button):
 
-LED colours:
+- Click: toggle the light.
+- Double-click: apply the theme (see below). It also switches the light on.
+- Hold for 5 seconds: forget the bulb, delete the bond and restart into pairing mode. The LED
+  flashes purple.
+
+CoreInk (the wheel on the side):
+
+- Press the wheel: toggle the light. Double-press: apply the theme.
+- Roll the wheel up: apply the theme.
+- Hold the wheel pressed for 5 seconds: forget the bulb and pair again.
+
+The top button and wheel-down are unused, because the ESP32 can only be woken from deep
+sleep by two of the CoreInk's buttons.
+
+A single click waits 350 ms to make sure it is not a double-click, before toggling. If the
+bulb is not connected, the action is queued and the connection is retried right away.
+
+ATOM LED colours (in low-power mode the LED is only lit while the board is awake):
 
 | LED | Meaning |
 | --- | --- |
@@ -48,6 +91,21 @@ LED colours:
 | Blinking yellow | Lost the bulb, reconnecting |
 | Fast purple | Pairing reset |
 
+### Theme
+
+The theme is set at the top of `src/main.cpp`:
+
+```cpp
+static const Theme THEME = {144, 447, 0.0f, 0.0f};
+```
+
+The fields are brightness (1 to 254), white tone in mireds (153 cool to 454 warm), and CIE x/y
+for a colour. Use either mireds or x/y: set mireds to 0 to use the colour. The default is a warm
+dimmed white close to the Hue "Relax" scene. To copy a look you made in the Hue app, set it,
+close the app, flash the `debug-dump` build and read the values of `932c32bd-0003` (brightness),
+`932c32bd-0004` (mireds, little-endian) and `932c32bd-0005` (x then y, little-endian, scaled
+to 0xFFFF).
+
 ## When it does not work
 
 - **Connect fails, or it never pairs.** Most often the Hue app is still connected to the bulb.
@@ -55,10 +113,12 @@ LED colours:
 - **"bulb did not answer the pairing request".** The bulb is not in pairing mode. Make it
   visible again.
 - **"encryption failed: bond lost?"** The bulb forgot the ATOM, for example after a reset.
-  Hold the button for 5 seconds and pair again.
+  Hold the button (CoreInk: the wheel) for 5 seconds and pair again.
 - **Pairing never works on a bulb that has been paired with many devices.** Its bond list may
   be full. Factory reset the bulb in the Hue app and pair the ATOM first.
-- **Random drops.** BLE range to the bulb is short. Keep the ATOM within 5 to 10 m.
+- **Random drops.** BLE range to the bulb is short. Keep the board within 5 to 10 m.
+- **Theme only changes brightness.** White-only bulbs have no colour or white-tone
+  characteristic, and colour values are ignored when `mireds` is not 0.
 - **"Hue light service not found".** Your bulb may use different UUIDs. The `debug-dump`
   build prints every service and characteristic after connecting:
 
@@ -72,7 +132,8 @@ LED colours:
 
 The bulb exposes a light control service (`932c32bd-0000-47a2-835a-a8d455b859dd`) with an
 on/off characteristic (`932c32bd-0002-...`). Writing `0x01` or `0x00` to it switches the light,
-and it also notifies, so the LED follows changes made from the app. The characteristic is only
+and it also notifies, so the LED follows changes made from the app. The theme writes
+brightness (`0003`), white tone (`0004`) or colour (`0005`) on the same service. The characteristic is only
 accessible over an encrypted, bonded link, which is why pairing mode is needed once.
 
 In its advertisements the bulb usually shows the 16-bit `0xFE0F` UUID rather than the light
