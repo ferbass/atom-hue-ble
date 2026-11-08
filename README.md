@@ -17,15 +17,18 @@ firmware 1.163.1). The CoreInk build compiles but has not been tested on hardwar
 
 In low-power builds a press wakes the board. It reconnects to the bulb, runs the action and
 stays awake for 5 seconds so quick follow-up presses are instant, then goes back to sleep.
-A press takes about 1 to 3 seconds to reach the light, in exchange for battery life measured
-in weeks instead of hours (estimated, not measured yet). As a bonus, the bulb is free for the Hue app while the board sleeps.
+A press takes about 1 to 3 seconds to reach the light, in exchange for much longer battery life. As a bonus, the bulb is free for the Hue app while the board sleeps.
 
 If the bulb cannot be reached within 25 seconds, the board gives up and sleeps
 (ATOM: three red flashes, CoreInk: "No bulb"). Press again to retry. Pairing mode gives up
 after 3 minutes the same way.
 
-On the ATOM Lite the RGB LED still draws around 1 mA while dark, so sleep current is not
-as low as the ESP32 alone. The CoreInk is the better choice for battery use.
+Each press costs about 8 seconds awake (connect, act, 5 s idle). Between presses the ESP32
+draws almost nothing, so battery life is set by the board's own sleep current. On the ATOM
+Lite the RGB LED draws around 1 mA even when dark, and the battery base adds its own drain,
+so expect days to a couple of weeks rather than months (estimated, not measured). The CoreInk
+is built for battery use and should last much longer. A USB power meter between the charger
+and the board shows the real sleep current.
 
 ## Build and flash
 
