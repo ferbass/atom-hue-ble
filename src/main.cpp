@@ -18,8 +18,27 @@ static const uint8_t DEFAULT_NORMAL[] = {0x01, 0x01, 0x01, 0x02, 0x01, 0xfe, 0x0
 static const uint8_t CANDLE[] = {0x01, 0x01, 0x01, 0x02, 0x01, 0x42, 0x04, 0x04, 0x70,
                                  0x7d, 0xf5, 0x68, 0x06, 0x01, 0x01, 0x08, 0x01, 0x80};
 static const size_t MAX_LOOK_LEN = 32;
+static const uint8_t EFFECT_SPEED = 0x80;
+
+struct Look {
+  const char* name;
+  uint8_t effect;
+};
+// Effect ids as listed by HueBLE. The menu only shows the ones the bulb reports supporting.
+static const Look LOOKS[] = {
+    {"Normal", 0x00},  {"Candle", 0x01},     {"Fireplace", 0x02}, {"Prism", 0x03},
+    {"Sunrise", 0x09}, {"Sparkle", 0x0a},    {"Opal", 0x0b},      {"Glisten", 0x0c},
+    {"Sunset", 0x0d},  {"Underwater", 0x0e}, {"Cosmos", 0x0f},    {"Sunbeam", 0x10},
+    {"Enchant", 0x11},
+};
+static const uint8_t LOOK_COUNT  = sizeof(LOOKS) / sizeof(LOOKS[0]);
+static const uint8_t NORMAL_LOOK = 0;
+static const uint8_t CANDLE_LOOK = 1;
+// In the capabilities characteristic (0001), entry 04 is a bitmask of supported effect ids.
+static const uint8_t CAPS_EFFECTS = 0x04;
 
 static const char* HUE_SERVICE_UUID    = "932c32bd-0000-47a2-835a-a8d455b859dd";
+static const char* HUE_CAPS_UUID       = "932c32bd-0001-47a2-835a-a8d455b859dd";
 static const char* HUE_ONOFF_UUID      = "932c32bd-0002-47a2-835a-a8d455b859dd";
 static const char* HUE_STATE_UUID      = "932c32bd-0007-47a2-835a-a8d455b859dd";
 // Hue bulbs usually advertise only this 16-bit Signify UUID, not the 128-bit light service.
@@ -47,6 +66,7 @@ static const uint32_t LOOP_DELAY_MS      = 5;
 
 // Low-power mode only.
 static const uint32_t IDLE_SLEEP_MS       = 5000;
+static const uint32_t MENU_IDLE_SLEEP_MS  = 15000;
 static const uint32_t CONNECT_GIVE_UP_MS  = 25000;
 static const uint32_t PAIRING_TIMEOUT_MS  = 180000;
 static const uint32_t DISCONNECT_WAIT_MS  = 1000;
@@ -56,6 +76,7 @@ static const char* NVS_NAMESPACE = "hue";
 static const char* NVS_KEY_MAC   = "mac";
 static const char* NVS_KEY_TYPE  = "type";
 static const char* NVS_KEY_NORMAL = "normal";
+static const char* NVS_KEY_EFFECTS = "effects";
 
 enum class State { Scanning, Connecting, Securing, Ready, Disconnecting, WaitRetry, Resetting };
 
@@ -67,6 +88,15 @@ static uint32_t nextAttemptAt = 0;
 static uint32_t retryDelay = RETRY_MIN_MS;
 static bool pairingMode = false;
 static uint32_t lastActivityAt = 0;
+
+// Survives deep sleep, so the screen can name the running look before reconnecting.
+RTC_DATA_ATTR static uint8_t activeLook = NORMAL_LOOK;
+static uint64_t supportedEffects = ~0ULL;
+static bool menuOpen = false;
+static uint8_t menuSelected = 0;
+static uint8_t menuCount = 0;
+static uint8_t menuLooks[LOOK_COUNT];
+static const char* menuNames[LOOK_COUNT];
 
 static Action pendingAction = Action::None;
 static uint32_t pendingSince = 0;
@@ -246,6 +276,73 @@ static void dumpGatt() {
 }
 #endif
 
+static bool findEntry(const uint8_t* data, size_t len, uint8_t type, const uint8_t** value,
+                      uint8_t* valueLen) {
+  for (size_t i = 0; i + 2 <= len;) {
+    uint8_t n = data[i + 1];
+    if (i + 2 + n > len) return false;
+    if (data[i] == type) {
+      *value = data + i + 2;
+      *valueLen = n;
+      return true;
+    }
+    i += 2 + n;
+  }
+  return false;
+}
+
+static void buildMenu() {
+  menuCount = 0;
+  for (uint8_t i = 0; i < LOOK_COUNT; i++) {
+    uint8_t effect = LOOKS[i].effect;
+    if (effect != 0 && !((supportedEffects >> effect) & 1)) continue;
+    menuLooks[menuCount] = i;
+    menuNames[menuCount] = LOOKS[i].name;
+    menuCount++;
+  }
+}
+
+static uint8_t menuIndexOf(uint8_t look) {
+  for (uint8_t i = 0; i < menuCount; i++) {
+    if (menuLooks[i] == look) return i;
+  }
+  return NO_ITEM;
+}
+
+static uint8_t lookForEffect(uint8_t effect) {
+  for (uint8_t i = 0; i < LOOK_COUNT; i++) {
+    if (LOOKS[i].effect == effect) return i;
+  }
+  return NORMAL_LOOK;
+}
+
+static void readCapabilities(NimBLERemoteService* svc) {
+  NimBLERemoteCharacteristic* caps = svc->getCharacteristic(HUE_CAPS_UUID);
+  if (!caps) return;
+  NimBLEAttValue v = caps->readValue();
+  const uint8_t* mask;
+  uint8_t n;
+  if (!findEntry(v.data(), v.size(), CAPS_EFFECTS, &mask, &n)) return;
+  uint64_t effects = 0;
+  for (uint8_t i = 0; i < n && i < 8; i++) effects |= (uint64_t)mask[i] << (8 * i);
+  if (effects != supportedEffects) {
+    supportedEffects = effects;
+    prefs.putULong64(NVS_KEY_EFFECTS, effects);
+    buildMenu();
+  }
+  Serial.printf("[gatt] %u looks available\n", menuCount);
+}
+
+static void readActiveLook() {
+  if (!stateChr) return;
+  NimBLEAttValue v = stateChr->readValue();
+  const uint8_t* effect;
+  uint8_t n;
+  bool hasEffect = findEntry(v.data(), v.size(), TLV_EFFECT, &effect, &n) && n == 1;
+  activeLook = hasEffect ? lookForEffect(effect[0]) : NORMAL_LOOK;
+  Serial.printf("[gatt] running look: %s\n", LOOKS[activeLook].name);
+}
+
 static bool setupGatt() {
   NimBLERemoteService* svc = client->getService(HUE_SERVICE_UUID);
   if (!svc) {
@@ -268,6 +365,8 @@ static bool setupGatt() {
   }
   lightOn = v.data()[0] != 0;
   Serial.printf("[gatt] light is currently %s\n", lightOn ? "ON" : "OFF");
+  readCapabilities(svc);
+  readActiveLook();
 
   if (onOffChr->canNotify()) {
     bool ok = onOffChr->subscribe(true, onNotify);
@@ -312,26 +411,50 @@ static bool writeLook(const char* name, const uint8_t* look, size_t len) {
   return true;
 }
 
-static void turnOnNormal() {
+static bool turnOnNormal() {
   uint8_t look[MAX_LOOK_LEN];
   size_t n = prefs.isKey(NVS_KEY_NORMAL) ? prefs.getBytes(NVS_KEY_NORMAL, look, sizeof(look)) : 0;
   if (n == 0) {
     memcpy(look, DEFAULT_NORMAL, sizeof(DEFAULT_NORMAL));
     n = sizeof(DEFAULT_NORMAL);
   }
-  writeLook("normal", look, n);
+  return writeLook("normal", look, n);
 }
 
 static void toggleLight() {
   if (lightOn || !stateChr) {
     setPower(!lightOn);
-  } else {
-    turnOnNormal();
+  } else if (turnOnNormal()) {
+    activeLook = NORMAL_LOOK;
   }
 }
 
-static void applyCandle() {
-  if (stateChr) writeLook("candle", CANDLE, sizeof(CANDLE));
+static void applyLook(uint8_t look) {
+  if (!stateChr || look >= LOOK_COUNT) return;
+  bool ok;
+  if (look == NORMAL_LOOK) {
+    ok = turnOnNormal();
+  } else if (look == CANDLE_LOOK) {
+    ok = writeLook("candle", CANDLE, sizeof(CANDLE));
+  } else {
+    uint8_t cmd[] = {TLV_POWER, 1, 1, TLV_EFFECT, 1, LOOKS[look].effect, TLV_EFFECT_SPEED, 1, EFFECT_SPEED};
+    ok = writeLook(LOOKS[look].name, cmd, sizeof(cmd));
+  }
+  if (ok) activeLook = look;
+}
+
+static void openMenu() {
+  menuOpen = true;
+  uint8_t i = menuIndexOf(activeLook);
+  menuSelected = i == NO_ITEM ? 0 : i;
+}
+
+static void moveMenu(int step) {
+  if (!menuOpen) {
+    openMenu();
+  } else if (menuCount) {
+    menuSelected = (menuSelected + menuCount + step) % menuCount;
+  }
 }
 
 // Copies a state snapshot with power forced on and effects removed, so the normal light is
@@ -374,7 +497,8 @@ static void runAction(Action action) {
   lastActivityAt = millis();
   switch (action) {
     case Action::Toggle: toggleLight(); break;
-    case Action::Candle: applyCandle(); break;
+    case Action::Candle: applyLook(CANDLE_LOOK); break;
+    case Action::Select: applyLook(menuLooks[menuSelected]); break;
     case Action::SaveNormal: saveNormal(); break;
     default: break;
   }
@@ -394,6 +518,14 @@ static void requestAction(Action action) {
   if (action == Action::None) return;
   if (action == Action::Reset) {
     beginReset();
+    return;
+  }
+  if (action == Action::Prev || action == Action::Next) {
+    moveMenu(action == Action::Next ? 1 : -1);
+    return;
+  }
+  if (action == Action::Select && !menuOpen) {
+    openMenu();
     return;
   }
   if (state == State::Ready) {
@@ -605,7 +737,7 @@ static void handlePower() {
   if (!LOW_POWER_MODE || state == State::Resetting || !buttonsIdle()) return;
   uint32_t idle = millis() - lastActivityAt;
   if (state == State::Ready) {
-    if (idle >= IDLE_SLEEP_MS) goToSleep(SleepReason::Idle);
+    if (idle >= (menuOpen ? MENU_IDLE_SLEEP_MS : IDLE_SLEEP_MS)) goToSleep(SleepReason::Idle);
   } else if (pairingMode) {
     if (idle >= PAIRING_TIMEOUT_MS) goToSleep(SleepReason::PairingTimeout);
   } else if (idle >= CONNECT_GIVE_UP_MS) {
@@ -619,6 +751,19 @@ static Mode currentMode() {
     case State::Resetting: return Mode::Resetting;
     default: return pairingMode ? Mode::Pairing : Mode::Connecting;
   }
+}
+
+static View currentView() {
+  View v = {};
+  v.mode = currentMode();
+  v.lightOn = lightOn;
+  v.look = LOOKS[activeLook < LOOK_COUNT ? activeLook : NORMAL_LOOK].name;
+  v.menuOpen = menuOpen;
+  v.items = menuNames;
+  v.itemCount = menuCount;
+  v.selected = menuSelected;
+  v.active = menuIndexOf(activeLook);
+  return v;
 }
 
 void setup() {
@@ -644,6 +789,8 @@ void setup() {
   client->setConnectTimeout(CONNECT_TIMEOUT_MS);
 
   prefs.begin(NVS_NAMESPACE, false);
+  supportedEffects = prefs.getULong64(NVS_KEY_EFFECTS, ~0ULL);
+  buildMenu();
   String mac = prefs.isKey(NVS_KEY_MAC) ? prefs.getString(NVS_KEY_MAC, "") : String();
   if (mac.length() == 17) {
     target = NimBLEAddress(std::string(mac.c_str()), prefs.getUChar(NVS_KEY_TYPE, BLE_ADDR_PUBLIC));
@@ -664,6 +811,6 @@ void loop() {
   handleBleEvents();
   handleTimers();
   handlePower();
-  board::show(currentMode(), lightOn, now);
+  board::show(currentView(), now);
   delay(LOOP_DELAY_MS);
 }

@@ -3,8 +3,8 @@
 Turns an M5Stack ATOM Lite or CoreInk into a one-button remote for a Philips Hue Bluetooth
 bulb. Click to switch your normal light on or off, double-click for the Hue Candle effect. It talks to the bulb directly over BLE, so there is no Hue Bridge and no Wi-Fi involved.
 
-Tested with an ATOM Lite (both builds) and a Hue White and Color Ambiance bulb (LCA002,
-firmware 1.163.1). The CoreInk build compiles but has not been tested on hardware yet.
+Tested with an ATOM Lite (both builds), a CoreInk on USB power, and a Hue White and Color
+Ambiance bulb (LCA002, firmware 1.163.1). CoreInk battery life has not been measured yet.
 
 ## Builds
 
@@ -12,7 +12,7 @@ firmware 1.163.1). The CoreInk build compiles but has not been tested on hardwar
 | --- | --- | --- |
 | `m5stack-atom` (default) | ATOM Lite | Stays connected. Instant toggle, but drains a battery in hours. |
 | `m5stack-atom-lowpower` | ATOM Lite | Deep sleeps between presses. |
-| `m5stack-coreink` | CoreInk | Deep sleeps between presses, shows the state on the e-ink screen. |
+| `m5stack-coreink` | CoreInk | Deep sleeps between presses, looks menu on the e-ink screen. |
 | `debug-dump` | ATOM Lite | Prints the bulb's GATT table after connecting. |
 
 In low-power builds a press wakes the board. It reconnects to the bulb, runs the action and
@@ -73,14 +73,18 @@ ATOM Lite (the only button):
 - Hold 5 seconds: forget the bulb, delete the bond and restart into pairing mode. The LED
   flashes purple.
 
-CoreInk (the wheel on the side):
+CoreInk:
 
-- Press the wheel: same as the ATOM click. Double-press: Candle.
-- Roll the wheel up: Candle.
-- Hold the wheel 2 seconds: save the normal light. 5 seconds: forget the bulb and pair again.
+- Power button (side): switch the light on (as your normal light) or off.
+- Press the wheel: open the looks menu. Roll the wheel up and down to move through Normal and
+  every effect the bulb supports, then press again to apply. A dot marks the running look.
+- Hold the wheel 2 seconds: save the current look as the normal light. 5 seconds: forget the
+  bulb and pair again.
 
-The top button and wheel-down are unused, because the ESP32 can only be woken from deep
-sleep by two of the CoreInk's buttons.
+Rolling the wheel does not wake the CoreInk, and neither does the top button: the ESP32 can
+only be woken from deep sleep by two of its buttons, the wheel press and the power button.
+The menu stays awake 15 seconds after the last input instead of 5. Before sleeping, the screen
+gets one full refresh to clear the ghosting left by the menu's fast updates.
 
 A single click waits 350 ms to make sure it is not a double-click, before toggling. If the
 bulb is not connected, the action is queued and the connection is retried right away.
@@ -102,9 +106,10 @@ look you want in the Hue app, close the app, then hold the button for 2 seconds.
 white tone and colour are saved; any effect is dropped so the normal light never flickers.
 The saved look is kept across sleep and reflashing, and is cleared by the 5 second reset.
 
-To change the double-click effect, edit `CANDLE` at the top of `src/main.cpp`. The effect id
-is the byte after `06 01`: 01 candle, 02 fireplace, 03 prism, 09 sunrise, 0a sparkle,
-0b opal, 0c glisten, 0d sunset, 0e underwater, 0f cosmos, 10 sunbeam, 11 enchant.
+Candle uses the colour captured from the Hue app. The other effects are sent with only their
+effect id and a medium speed, and the bulb picks the colours. The list is `LOOKS` at the top of
+`src/main.cpp`. The CoreInk menu only shows effects the bulb lists as supported in its
+capabilities characteristic (`0001`, entry `04`, a bitmask of effect ids).
 
 ## When it does not work
 

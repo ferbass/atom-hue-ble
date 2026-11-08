@@ -51,13 +51,13 @@ bool isPressed(size_t button) { return digitalRead(BUTTONS[button].pin) == LOW; 
 
 int wakeButton() { return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 ? 0 : -1; }
 
-void show(Mode mode, bool lightOn, uint32_t now) {
-  switch (mode) {
+void show(const View& view, uint32_t now) {
+  switch (view.mode) {
     case Mode::Resetting:
       setLed((now / FAST_BLINK_MS) % 2 ? COLOR_RESET : COLOR_BLACK);
       break;
     case Mode::Ready:
-      setLed(lightOn ? COLOR_ON : COLOR_OFF);
+      setLed(view.lightOn ? COLOR_ON : COLOR_OFF);
       break;
     case Mode::Pairing:
       setLed((now / BLINK_MS) % 2 ? COLOR_PAIRING : COLOR_BLACK);
