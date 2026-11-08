@@ -4,23 +4,24 @@
 
 #include "board.h"
 
-// The look applied by the theme gesture. Colour bulbs use the CIE 1931 x/y coordinates;
-// bulbs without colour fall back to `mireds` (153 = cool, 454 = warmest a white bulb can do).
-// Set x/y to 0 to always use mireds. Brightness is 1-254.
-struct Theme {
-  uint8_t brightness;
-  uint16_t mireds;
-  float x;
-  float y;
-};
-// Candlelight: about 1900 K at 35% brightness.
-static const Theme THEME = {90, 454, 0.5381f, 0.4111f};
+// Looks are written to the bulb's combined state characteristic (0007) as a list of
+// [type, length, value...] entries, the format HueBLE (github.com/flip-dots/HueBLE) documents:
+// 01 power, 02 brightness (1-254), 03 mireds (LE), 04 CIE x/y (LE, scaled to 0xFFFF),
+// 05 transition (LE, 100 ms units), 06 effect (01 candle, 02 fireplace, ...), 08 effect speed.
+static const uint8_t TLV_POWER        = 0x01;
+static const uint8_t TLV_EFFECT       = 0x06;
+static const uint8_t TLV_EFFECT_SPEED = 0x08;
+
+// Steady 2730 K at full brightness. Holding the button 2 s replaces it with the current look.
+static const uint8_t DEFAULT_NORMAL[] = {0x01, 0x01, 0x01, 0x02, 0x01, 0xfe, 0x03, 0x02, 0x6e, 0x01};
+// The Hue app's Candle effect, captured from an LCA002 bulb.
+static const uint8_t CANDLE[] = {0x01, 0x01, 0x01, 0x02, 0x01, 0x42, 0x04, 0x04, 0x70,
+                                 0x7d, 0xf5, 0x68, 0x06, 0x01, 0x01, 0x08, 0x01, 0x80};
+static const size_t MAX_LOOK_LEN = 32;
 
 static const char* HUE_SERVICE_UUID    = "932c32bd-0000-47a2-835a-a8d455b859dd";
 static const char* HUE_ONOFF_UUID      = "932c32bd-0002-47a2-835a-a8d455b859dd";
-static const char* HUE_BRIGHTNESS_UUID = "932c32bd-0003-47a2-835a-a8d455b859dd";
-static const char* HUE_MIREDS_UUID     = "932c32bd-0004-47a2-835a-a8d455b859dd";
-static const char* HUE_XY_UUID         = "932c32bd-0005-47a2-835a-a8d455b859dd";
+static const char* HUE_STATE_UUID      = "932c32bd-0007-47a2-835a-a8d455b859dd";
 // Hue bulbs usually advertise only this 16-bit Signify UUID, not the 128-bit light service.
 static const uint16_t HUE_ADV_UUID16 = 0xFE0F;
 static const char* HUE_NAME_HINT     = "Hue";
@@ -33,6 +34,7 @@ static constexpr bool LOW_POWER_MODE = false;
 
 static const uint32_t DEBOUNCE_MS        = 50;
 static const uint32_t DOUBLE_CLICK_MS    = 350;
+static const uint32_t SAVE_HOLD_MS       = 2000;
 static const uint32_t RESET_HOLD_MS      = 5000;
 static const uint32_t RESET_FLASH_MS     = 1500;
 static const uint32_t SCAN_WINDOW_MS     = 5000;
@@ -53,6 +55,7 @@ static const uint32_t LOW_POWER_CPU_MHZ   = 80;
 static const char* NVS_NAMESPACE = "hue";
 static const char* NVS_KEY_MAC   = "mac";
 static const char* NVS_KEY_TYPE  = "type";
+static const char* NVS_KEY_NORMAL = "normal";
 
 enum class State { Scanning, Connecting, Securing, Ready, Disconnecting, WaitRetry, Resetting };
 
@@ -70,9 +73,7 @@ static uint32_t pendingSince = 0;
 
 static NimBLEClient* client = nullptr;
 static NimBLERemoteCharacteristic* onOffChr = nullptr;
-static NimBLERemoteCharacteristic* brightnessChr = nullptr;
-static NimBLERemoteCharacteristic* miredsChr = nullptr;
-static NimBLERemoteCharacteristic* xyChr = nullptr;
+static NimBLERemoteCharacteristic* stateChr = nullptr;
 static NimBLEAddress target;
 static NimBLEAddress candidate;
 static int candidateRssi = -128;
@@ -178,7 +179,7 @@ static void startScan() {
 }
 
 static void clearCharacteristics() {
-  onOffChr = brightnessChr = miredsChr = xyChr = nullptr;
+  onOffChr = stateChr = nullptr;
 }
 
 static void scheduleRetry() {
@@ -256,11 +257,8 @@ static bool setupGatt() {
     Serial.println("[gatt] ERROR: on/off characteristic not found (build env 'debug-dump' to inspect)");
     return false;
   }
-  brightnessChr = svc->getCharacteristic(HUE_BRIGHTNESS_UUID);
-  miredsChr = svc->getCharacteristic(HUE_MIREDS_UUID);
-  xyChr = svc->getCharacteristic(HUE_XY_UUID);
-  Serial.printf("[gatt] bulb supports:%s%s%s\n", brightnessChr ? " brightness" : "",
-                miredsChr ? " white-tone" : "", xyChr ? " colour" : "");
+  stateChr = svc->getCharacteristic(HUE_STATE_UUID);
+  if (!stateChr) Serial.println("[gatt] no combined state characteristic: only on/off is available");
 
   NimBLEAttValue v = onOffChr->readValue();
   if (v.size() < 1) {
@@ -297,43 +295,87 @@ static bool setPower(bool on) {
   return true;
 }
 
-static void toggleLight() { setPower(!lightOn); }
-
-static bool writeLook() {
-  bool ok = true;
-  if (brightnessChr) {
-    uint8_t bri = constrain(THEME.brightness, 1, 254);
-    ok &= brightnessChr->writeValue(&bri, 1, true);
-  }
-  if (THEME.x > 0 && THEME.y > 0 && xyChr) {
-    uint16_t x = (uint16_t)(constrain(THEME.x, 0.0f, 1.0f) * 0xFFFF);
-    uint16_t y = (uint16_t)(constrain(THEME.y, 0.0f, 1.0f) * 0xFFFF);
-    uint8_t xy[4] = {(uint8_t)(x & 0xFF), (uint8_t)(x >> 8), (uint8_t)(y & 0xFF), (uint8_t)(y >> 8)};
-    Serial.printf("[theme] colour x=%.4f y=%.4f (raw %02x%02x%02x%02x)\n", THEME.x, THEME.y, xy[0],
-                  xy[1], xy[2], xy[3]);
-    ok &= xyChr->writeValue(xy, sizeof(xy), true);
-  } else if (THEME.mireds && miredsChr) {
-    uint8_t ct[2] = {(uint8_t)(THEME.mireds & 0xFF), (uint8_t)(THEME.mireds >> 8)};
-    Serial.printf("[theme] white tone %u mireds (raw %02x%02x)\n", THEME.mireds, ct[0], ct[1]);
-    ok &= miredsChr->writeValue(ct, sizeof(ct), true);
-  }
-  return ok;
+static void printHex(const char* label, const uint8_t* data, size_t len) {
+  Serial.print(label);
+  for (size_t i = 0; i < len; i++) Serial.printf("%02x", data[i]);
+  Serial.println();
 }
 
-static void applyTheme() {
-  Serial.println("[theme] applying theme");
-  // Setting the look before switching on avoids a flash of the old colour. Some bulbs refuse
-  // these writes while off, so retry once the light is on.
-  bool lookOk = writeLook();
-  if (!lightOn && !setPower(true)) return;
-  if (!lookOk && !writeLook()) Serial.println("[theme] ERROR: bulb rejected part of the theme");
+static bool writeLook(const char* name, const uint8_t* look, size_t len) {
+  Serial.printf("[look] %s: ", name);
+  printHex("", look, len);
+  if (!stateChr->writeValue(look, len, true)) {
+    Serial.println("[look] ERROR: bulb rejected the look");
+    return false;
+  }
+  lightOn = true;
+  return true;
+}
+
+static void turnOnNormal() {
+  uint8_t look[MAX_LOOK_LEN];
+  size_t n = prefs.isKey(NVS_KEY_NORMAL) ? prefs.getBytes(NVS_KEY_NORMAL, look, sizeof(look)) : 0;
+  if (n == 0) {
+    memcpy(look, DEFAULT_NORMAL, sizeof(DEFAULT_NORMAL));
+    n = sizeof(DEFAULT_NORMAL);
+  }
+  writeLook("normal", look, n);
+}
+
+static void toggleLight() {
+  if (lightOn || !stateChr) {
+    setPower(!lightOn);
+  } else {
+    turnOnNormal();
+  }
+}
+
+static void applyCandle() {
+  if (stateChr) writeLook("candle", CANDLE, sizeof(CANDLE));
+}
+
+// Copies a state snapshot with power forced on and effects removed, so the normal light is
+// always steady. Returns 0 if the snapshot is malformed or too long.
+static size_t buildNormal(const uint8_t* src, size_t len, uint8_t* out) {
+  size_t n = 0;
+  out[n++] = TLV_POWER;
+  out[n++] = 1;
+  out[n++] = 1;
+  for (size_t i = 0; i < len;) {
+    if (i + 2 > len) return 0;
+    uint8_t type = src[i];
+    size_t entry = 2 + src[i + 1];
+    if (i + entry > len) return 0;
+    if (type != TLV_POWER && type != TLV_EFFECT && type != TLV_EFFECT_SPEED) {
+      if (n + entry > MAX_LOOK_LEN) return 0;
+      memcpy(out + n, src + i, entry);
+      n += entry;
+    }
+    i += entry;
+  }
+  return n;
+}
+
+static void saveNormal() {
+  if (!stateChr) return;
+  NimBLEAttValue v = stateChr->readValue();
+  uint8_t look[MAX_LOOK_LEN];
+  size_t n = buildNormal(v.data(), v.size(), look);
+  if (v.size() == 0 || n <= 3) {
+    printHex("[look] ERROR: could not read a usable state: ", v.data(), v.size());
+    return;
+  }
+  prefs.putBytes(NVS_KEY_NORMAL, look, n);
+  printHex("[look] saved normal: ", look, n);
+  board::confirmSaved();
 }
 
 static void runAction(Action action) {
   lastActivityAt = millis();
   switch (action) {
     case Action::Toggle: toggleLight(); break;
-    case Action::Theme: applyTheme(); break;
+    case Action::Candle: applyCandle(); break;
+    case Action::SaveNormal: saveNormal(); break;
     default: break;
   }
 }
@@ -407,6 +449,10 @@ static void handleButton(size_t i, uint32_t now) {
     if (b.stable) {
       b.pressedAt = now;
       b.holdFired = false;
+    } else if (!b.holdFired && now - b.pressedAt >= SAVE_HOLD_MS && def.longPress != Action::None) {
+      b.clicks = 0;
+      Serial.printf("[btn] %s long press\n", def.name);
+      requestAction(def.longPress);
     } else if (!b.holdFired) {
       b.clicks++;
       b.releasedAt = now;
@@ -555,9 +601,9 @@ static void goToSleep(SleepReason reason) {
   board::sleep(reason);
 }
 
-static void handlePower(uint32_t now) {
+static void handlePower() {
   if (!LOW_POWER_MODE || state == State::Resetting || !buttonsIdle()) return;
-  uint32_t idle = now - lastActivityAt;
+  uint32_t idle = millis() - lastActivityAt;
   if (state == State::Ready) {
     if (idle >= IDLE_SLEEP_MS) goToSleep(SleepReason::Idle);
   } else if (pairingMode) {
@@ -617,7 +663,7 @@ void loop() {
   for (size_t i = 0; i < board::BUTTON_COUNT; i++) handleButton(i, now);
   handleBleEvents();
   handleTimers();
-  handlePower(now);
+  handlePower();
   board::show(currentMode(), lightOn, now);
   delay(LOOP_DELAY_MS);
 }

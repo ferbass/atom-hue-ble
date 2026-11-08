@@ -19,6 +19,7 @@ static const uint32_t COLOR_OFF       = Adafruit_NeoPixel::Color(160, 0, 0);
 static const uint32_t COLOR_PAIRING   = Adafruit_NeoPixel::Color(0, 0, 255);
 static const uint32_t COLOR_RECONNECT = Adafruit_NeoPixel::Color(255, 160, 0);
 static const uint32_t COLOR_RESET     = Adafruit_NeoPixel::Color(180, 0, 255);
+static const uint32_t COLOR_SAVED     = Adafruit_NeoPixel::Color(0, 200, 40);
 
 static Adafruit_NeoPixel led(1, LED_PIN, NEO_GRB + NEO_KHZ800);
 static uint32_t shownColor = COLOR_BLACK;
@@ -35,7 +36,7 @@ namespace board {
 const char* const NAME = "ATOM Lite";
 
 const ButtonDef BUTTONS[] = {
-    {BUTTON_PIN, "button", Action::Toggle, Action::Theme, Action::Reset},
+    {BUTTON_PIN, "button", Action::Toggle, Action::Candle, Action::SaveNormal, Action::Reset},
 };
 const size_t BUTTON_COUNT = sizeof(BUTTONS) / sizeof(BUTTONS[0]);
 
@@ -64,6 +65,15 @@ void show(Mode mode, bool lightOn, uint32_t now) {
     case Mode::Connecting:
       setLed((now / BLINK_MS) % 2 ? COLOR_RECONNECT : COLOR_BLACK);
       break;
+  }
+}
+
+void confirmSaved() {
+  for (int i = 0; i < 2; i++) {
+    setLed(COLOR_SAVED);
+    delay(FAST_BLINK_MS * 2);
+    setLed(COLOR_BLACK);
+    delay(FAST_BLINK_MS);
   }
 }
 

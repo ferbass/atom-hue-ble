@@ -3,13 +3,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum class Action : uint8_t { None, Toggle, Theme, Reset };
+enum class Action : uint8_t { None, Toggle, Candle, SaveNormal, Reset };
 
 struct ButtonDef {
   uint8_t pin;
   const char* name;
   Action click;
   Action doubleClick;
+  // Fires on release after a hold shorter than `hold` needs.
+  Action longPress;
   Action hold;
 };
 
@@ -28,6 +30,8 @@ bool isPressed(size_t button);
 // Index of the button that woke the board from deep sleep, or -1.
 int wakeButton();
 void show(Mode mode, bool lightOn, uint32_t now);
+// Short visible acknowledgement that the normal light was saved.
+void confirmSaved();
 // Waits for all buttons to be released, then deep sleeps until a button is pressed.
 [[noreturn]] void sleep(SleepReason reason);
 

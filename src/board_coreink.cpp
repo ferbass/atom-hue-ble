@@ -24,11 +24,13 @@ static const uint32_t SHOW_CONNECTING_AFTER_MS = 3000;
 enum class Screen : uint8_t { None, Pairing, Connecting, On, Off, Resetting, Unreachable, PairingTimeout };
 
 static Screen shownScreen = Screen::None;
+static bool savedNote = false;
 static Mode lastMode = Mode::Connecting;
 static uint32_t modeSince = 0;
 
-static void draw(Screen screen) {
-  if (screen == shownScreen) return;
+static void draw(Screen screen, bool force = false) {
+  if (screen == shownScreen && !force) return;
+  if (screen != shownScreen && !force) savedNote = false;
   shownScreen = screen;
 
   const char* title = "";
@@ -37,8 +39,8 @@ static void draw(Screen screen) {
     case Screen::None: return;
     case Screen::Pairing:        title = "Pairing";     hint = "Hue app: Make visible"; break;
     case Screen::Connecting:     title = "Connecting";  hint = "is the Hue app open?"; break;
-    case Screen::On:             title = "ON";          hint = "press: toggle  up: theme"; break;
-    case Screen::Off:            title = "OFF";         hint = "press: toggle  up: theme"; break;
+    case Screen::On:             title = "ON";          hint = "press: toggle  up: candle"; break;
+    case Screen::Off:            title = "OFF";         hint = "press: toggle  up: candle"; break;
     case Screen::Resetting:      title = "Reset";       hint = "forgetting the bulb"; break;
     case Screen::Unreachable:    title = "No bulb";     hint = "press to retry"; break;
     case Screen::PairingTimeout: title = "Not paired";  hint = "press to pair again"; break;
@@ -60,7 +62,7 @@ static void draw(Screen screen) {
 
   M5.Display.setTextDatum(bottom_center);
   M5.Display.setFont(&fonts::FreeSans9pt7b);
-  M5.Display.drawString(hint, 100, 192);
+  M5.Display.drawString(savedNote ? "normal light saved" : hint, 100, 192);
   M5.Display.endWrite();
 }
 
@@ -69,8 +71,8 @@ namespace board {
 const char* const NAME = "CoreInk";
 
 const ButtonDef BUTTONS[] = {
-    {WHEEL_PRESS_PIN, "wheel press", Action::Toggle, Action::Theme, Action::Reset},
-    {WHEEL_UP_PIN, "wheel up", Action::Theme, Action::None, Action::None},
+    {WHEEL_PRESS_PIN, "wheel press", Action::Toggle, Action::Candle, Action::SaveNormal, Action::Reset},
+    {WHEEL_UP_PIN, "wheel up", Action::Candle, Action::None, Action::None, Action::None},
 };
 const size_t BUTTON_COUNT = sizeof(BUTTONS) / sizeof(BUTTONS[0]);
 
@@ -122,6 +124,11 @@ void show(Mode mode, bool lightOn, uint32_t now) {
       M5.Display.waitDisplay();
       break;
   }
+}
+
+void confirmSaved() {
+  savedNote = true;
+  draw(shownScreen == Screen::None ? Screen::On : shownScreen, true);
 }
 
 void sleep(SleepReason reason) {

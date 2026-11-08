@@ -1,11 +1,10 @@
 # atom-hue-ble
 
 Turns an M5Stack ATOM Lite or CoreInk into a one-button remote for a Philips Hue Bluetooth
-bulb. Press the button, the light toggles. Double-click, and it switches to your favourite
-look. It talks to the bulb directly over BLE, so there is no Hue Bridge and no Wi-Fi involved.
+bulb. Click to switch your normal light on or off, double-click for the Hue Candle effect. It talks to the bulb directly over BLE, so there is no Hue Bridge and no Wi-Fi involved.
 
-Tested with an ATOM Lite and a single Hue bulb. The CoreInk build and the low-power mode
-build cleanly but have not been tested on hardware yet.
+Tested with an ATOM Lite (both builds) and a Hue White and Color Ambiance bulb (LCA002,
+firmware 1.163.1). The CoreInk build compiles but has not been tested on hardware yet.
 
 ## Builds
 
@@ -64,16 +63,18 @@ From then on it connects straight to the saved bulb at boot.
 
 ATOM Lite (the only button):
 
-- Click: toggle the light.
-- Double-click: apply the theme (see below). It also switches the light on.
-- Hold for 5 seconds: forget the bulb, delete the bond and restart into pairing mode. The LED
+- Click: if the light is on, switch it off. If it is off, switch it on as your normal light.
+- Double-click: Candle effect. The bulb runs the flicker itself, so the board can sleep.
+- Hold 2 seconds and release: save the bulb's current look as your normal light. The LED blinks
+  green twice.
+- Hold 5 seconds: forget the bulb, delete the bond and restart into pairing mode. The LED
   flashes purple.
 
 CoreInk (the wheel on the side):
 
-- Press the wheel: toggle the light. Double-press: apply the theme.
-- Roll the wheel up: apply the theme.
-- Hold the wheel pressed for 5 seconds: forget the bulb and pair again.
+- Press the wheel: same as the ATOM click. Double-press: Candle.
+- Roll the wheel up: Candle.
+- Hold the wheel 2 seconds: save the normal light. 5 seconds: forget the bulb and pair again.
 
 The top button and wheel-down are unused, because the ESP32 can only be woken from deep
 sleep by two of the CoreInk's buttons.
@@ -91,41 +92,16 @@ ATOM LED colours (in low-power mode the LED is only lit while the board is awake
 | Blinking yellow | Lost the bulb, reconnecting |
 | Fast purple | Pairing reset |
 
-### Theme
+### Normal light
 
-The theme is set at the top of `src/main.cpp`. The default is candlelight:
+Out of the box the normal light is a steady 2730 K at full brightness. To change it, set the
+look you want in the Hue app, close the app, then hold the button for 2 seconds. Brightness,
+white tone and colour are saved; any effect is dropped so the normal light never flickers.
+The saved look is kept across sleep and reflashing, and is cleared by the 5 second reset.
 
-```cpp
-static const Theme THEME = {90, 454, 0.5381f, 0.4111f};
-```
-
-The fields are brightness (1 to 254), a white tone in mireds, and CIE x/y for a colour. Colour
-bulbs use x/y. Bulbs without colour fall back to mireds, and 454 (about 2200 K) is the warmest
-they can do. Candlelight is about 1900 K, so only colour bulbs get the full effect.
-
-The Hue app's animated "Candle" effect cannot be reproduced this way: the firmware sets a
-still colour and brightness.
-
-#### Copying a look from the Hue app
-
-1. Set the look in the Hue app, then close the app so the bulb is free.
-2. Flash `debug-dump` and open the monitor:
-
-   ```bash
-   pio run -e debug-dump -t upload && pio device monitor
-   ```
-
-3. In the dump, read these values. All of them are little-endian.
-
-   | Characteristic | Meaning | Example `value=` | Decoded |
-   | --- | --- | --- | --- |
-   | `932c32bd-0003` | brightness | `5a` | 90 |
-   | `932c32bd-0004` | mireds | `c601` | 0x01c6 = 454 |
-   | `932c32bd-0005` | x, y | `c0893d69` | 0x89c0 / 65535 = 0.5381, 0x693d / 65535 = 0.4111 |
-
-4. Put the numbers in `THEME`, flash your normal build and double-click. The serial log shows
-   `[theme] colour x=... (raw ...)`. Flash `debug-dump` again and check that the raw bytes
-   match what the bulb reports.
+To change the double-click effect, edit `CANDLE` at the top of `src/main.cpp`. The effect id
+is the byte after `06 01`: 01 candle, 02 fireplace, 03 prism, 09 sunrise, 0a sparkle,
+0b opal, 0c glisten, 0d sunset, 0e underwater, 0f cosmos, 10 sunbeam, 11 enchant.
 
 ## When it does not work
 
@@ -138,8 +114,8 @@ still colour and brightness.
 - **Pairing never works on a bulb that has been paired with many devices.** Its bond list may
   be full. Factory reset the bulb in the Hue app and pair the ATOM first.
 - **Random drops.** BLE range to the bulb is short. Keep the board within 5 to 10 m.
-- **Theme only changes brightness.** White-only bulbs have no colour or white-tone
-  characteristic, and colour values are ignored when `mireds` is not 0.
+- **Click only switches on and off, double-click does nothing.** The bulb has no combined
+  state characteristic (`0007`), which older firmware lacks. Update the bulb in the Hue app.
 - **"Hue light service not found".** Your bulb may use different UUIDs. The `debug-dump`
   build prints every service and characteristic after connecting:
 
@@ -151,16 +127,34 @@ still colour and brightness.
 
 ## How it works
 
-The bulb exposes a light control service (`932c32bd-0000-47a2-835a-a8d455b859dd`) with an
-on/off characteristic (`932c32bd-0002-...`). Writing `0x01` or `0x00` to it switches the light,
-and it also notifies, so the LED follows changes made from the app. The theme writes
-brightness (`0003`), white tone (`0004`) or colour (`0005`) on the same service. The characteristic is only
-accessible over an encrypted, bonded link, which is why pairing mode is needed once.
+The bulb exposes a light control service (`932c32bd-0000-47a2-835a-a8d455b859dd`). Its on/off
+characteristic (`0002`) takes `0x01` or `0x00` and notifies, so the LED follows changes made
+from the app. The combined state characteristic (`0007`) takes a list of
+`[type, length, value]` entries in one write:
+
+| Type | Value |
+| --- | --- |
+| `01` | power, 1 byte |
+| `02` | brightness, 1 to 254 |
+| `03` | white tone in mireds, 2 bytes little-endian |
+| `04` | CIE x and y, 2 bytes each, little-endian, scaled to 0xFFFF |
+| `05` | transition time, 2 bytes little-endian, in 100 ms units |
+| `06` | effect id (`00` none, `01` candle, ...) |
+| `08` | effect speed |
+
+Reading it returns the current state in the same format, with the colour entry when the bulb is
+in colour mode and the white tone entry when it is in white mode. Leaving the effect entry out
+of a write stops a running effect. The format matches
+[HueBLE](https://github.com/flip-dots/HueBLE).
+
+These characteristics are only accessible over an encrypted, bonded link, which is why pairing
+mode is needed once.
 
 In its advertisements the bulb usually shows the 16-bit `0xFE0F` UUID rather than the light
 service, so the scan matches on either, or on a name containing "Hue".
 
-Pins, timings, colours and brightness are constants at the top of `src/main.cpp`.
+Timings, the default normal light and the Candle command are constants at the top of
+`src/main.cpp`. Pins and LED colours are in `src/board_atom.cpp` and `src/board_coreink.cpp`.
 
 ## License
 
