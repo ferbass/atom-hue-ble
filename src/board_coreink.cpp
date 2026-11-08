@@ -159,6 +159,8 @@ extern "C" void initVariant() {
   digitalWrite(POWER_HOLD_PIN, HIGH);
 }
 
+static void holdPower();
+
 namespace board {
 
 const char* const NAME = "CoreInk";
@@ -171,6 +173,37 @@ const ButtonDef BUTTONS[] = {
 };
 const size_t BUTTON_COUNT = sizeof(BUTTONS) / sizeof(BUTTONS[0]);
 
+static void holdPower() {
+  pinMode(POWER_HOLD_PIN, OUTPUT);
+  digitalWrite(POWER_HOLD_PIN, HIGH);
+}
+
+static bool powerHeld() {
+  return (GPIO.enable & (1UL << POWER_HOLD_PIN)) && (GPIO.out & (1UL << POWER_HOLD_PIN));
+}
+
+static int monthFromBuildDate(const char* date) {
+  static const char* const MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char* found = strstr(MONTHS, String(date).substring(0, 3).c_str());
+  return found ? (found - MONTHS) / 3 + 1 : 1;
+}
+
+// The RTC does not run until it has been set once. The build time is close enough for logs.
+static void startClockIfStopped() {
+  if (!M5.Rtc.isEnabled()) return;
+  auto dt = M5.Rtc.getDateTime();
+  if (dt.date.year >= 2024 && !M5.Rtc.getVoltLow()) return;
+  m5::rtc_datetime_t build;
+  build.date.year = atoi(__DATE__ + 7);
+  build.date.month = monthFromBuildDate(__DATE__);
+  build.date.date = atoi(__DATE__ + 4);
+  build.time.hours = atoi(__TIME__);
+  build.time.minutes = atoi(__TIME__ + 3);
+  build.time.seconds = atoi(__TIME__ + 6);
+  M5.Rtc.setDateTime(build);
+  Serial.println("[clock] RTC was not running, set it to the build time");
+}
+
 void begin() {
   auto cfg = M5.config();
   cfg.clear_display = false;
@@ -178,7 +211,15 @@ void begin() {
   cfg.internal_imu = false;
   cfg.internal_mic = false;
   cfg.internal_spk = false;
+  // Board auto-detection probes GPIO12 with pull resistors to tell PICO-D4 boards apart. On
+  // the CoreInk that pin is the power hold, so probing it cuts the power on battery.
+  m5gfx::detect_config_t detect;
+  detect.fixed_board = m5gfx::board_t::board_M5StackCoreInk;
+  M5.Display.setDetectConfig(detect);
   M5.begin(cfg);
+  holdPower();
+  Serial.printf("[power] hold pin %s\n", powerHeld() ? "high" : "NOT HIGH");
+  startClockIfStopped();
   M5.Display.setEpdMode(epd_mode_t::epd_fast);
   M5.Display.setRotation(0);
 
@@ -186,6 +227,19 @@ void begin() {
 }
 
 uint16_t batteryMillivolts() { return M5.Power.getBatteryVoltage(); }
+
+// The BM8563 RTC runs from the battery, so it keeps counting while the CoreInk is off.
+uint32_t clockSeconds() {
+  if (!M5.Rtc.isEnabled()) return 0;
+  auto dt = M5.Rtc.getDateTime();
+  int y = dt.date.year - (dt.date.month <= 2);
+  int era = y / 400;
+  unsigned yoe = y - era * 400;
+  unsigned doy = (153 * (dt.date.month + (dt.date.month > 2 ? -3 : 9)) + 2) / 5 + dt.date.date - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long days = era * 146097L + doe - 719468;
+  return days * 86400UL + dt.time.hours * 3600UL + dt.time.minutes * 60UL + dt.time.seconds;
+}
 
 bool isPressed(size_t button) { return digitalRead(BUTTONS[button].pin) == LOW; }
 

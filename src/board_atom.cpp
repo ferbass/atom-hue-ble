@@ -53,6 +53,8 @@ int wakeButton() { return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 
 
 uint16_t batteryMillivolts() { return 0; }
 
+uint32_t clockSeconds() { return 0; }
+
 void show(const View& view, uint32_t now) {
   switch (view.mode) {
     case Mode::Resetting:

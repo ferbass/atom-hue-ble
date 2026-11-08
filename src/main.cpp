@@ -77,16 +77,20 @@ static const char* NVS_KEY_MAC   = "mac";
 static const char* NVS_KEY_TYPE  = "type";
 static const char* NVS_KEY_NORMAL = "normal";
 static const char* NVS_KEY_EFFECTS = "effects";
-static const char* NVS_KEY_BOOTS   = "boots";
-static const size_t BOOT_HISTORY   = 16;
+static const char* NVS_KEY_EVENTS  = "events";
+static const size_t EVENT_HISTORY  = 24;
+static const uint8_t EVENT_SLEEP   = 0xFE;
 
-// Kept in flash so it survives the board losing power: tells whether the board woke from deep
-// sleep or had switched off, and what the battery looked like each time.
-struct BootRecord {
-  uint8_t reset;
-  uint8_t wake;
+// Kept in flash so it survives the board losing power: a boot (reset reason + wake source) or
+// a sleep (reason), with the battery voltage and a timestamp when the board has a clock.
+struct Event {
+  uint32_t seconds;
   uint16_t millivolts;
+  uint8_t kind;
+  uint8_t detail;
 };
+
+static void recordEvent(uint8_t kind, uint8_t detail, bool print);
 
 enum class State { Scanning, Connecting, Securing, Ready, Disconnecting, WaitRetry, Resetting };
 
@@ -739,6 +743,7 @@ static void goToSleep(SleepReason reason) {
     uint32_t start = millis();
     while (client->isConnected() && millis() - start < DISCONNECT_WAIT_MS) delay(10);
   }
+  recordEvent(EVENT_SLEEP, (uint8_t)reason, false);
   Serial.flush();
   board::sleep(reason);
 }
@@ -787,24 +792,41 @@ static const char* wakeName(uint8_t cause) {
   }
 }
 
-static void recordBoot() {
-  BootRecord history[BOOT_HISTORY] = {};
-  size_t count = 0;
-  if (prefs.isKey(NVS_KEY_BOOTS)) {
-    count = prefs.getBytes(NVS_KEY_BOOTS, history, sizeof(history)) / sizeof(BootRecord);
+static const char* sleepName(uint8_t reason) {
+  switch ((SleepReason)reason) {
+    case SleepReason::Idle: return "idle";
+    case SleepReason::Unreachable: return "unreachable";
+    case SleepReason::PairingTimeout: return "pairing timeout";
   }
-  if (count == BOOT_HISTORY) {
-    memmove(history, history + 1, sizeof(BootRecord) * (BOOT_HISTORY - 1));
+  return "?";
+}
+
+static void recordEvent(uint8_t kind, uint8_t detail, bool print) {
+  Event history[EVENT_HISTORY] = {};
+  size_t count = 0;
+  if (prefs.isKey(NVS_KEY_EVENTS)) {
+    count = prefs.getBytes(NVS_KEY_EVENTS, history, sizeof(history)) / sizeof(Event);
+  }
+  if (count == EVENT_HISTORY) {
+    memmove(history, history + 1, sizeof(Event) * (EVENT_HISTORY - 1));
     count--;
   }
-  history[count++] = {(uint8_t)esp_reset_reason(), (uint8_t)esp_sleep_get_wakeup_cause(),
-                      board::batteryMillivolts()};
-  prefs.putBytes(NVS_KEY_BOOTS, history, count * sizeof(BootRecord));
+  history[count++] = {board::clockSeconds(), board::batteryMillivolts(), kind, detail};
+  prefs.putBytes(NVS_KEY_EVENTS, history, count * sizeof(Event));
+  if (!print) return;
 
-  Serial.println("[boot] history, oldest first:");
+  uint32_t now = history[count - 1].seconds;
+  Serial.println("[log] events, oldest first (time relative to this boot):");
   for (size_t i = 0; i < count; i++) {
-    Serial.printf("[boot]   %-10s wake=%-12s battery=%u mV\n", resetName(history[i].reset),
-                  wakeName(history[i].wake), history[i].millivolts);
+    const Event& e = history[i];
+    char when[16] = "";
+    if (now) snprintf(when, sizeof(when), "%+lds", (long)(e.seconds - now));
+    if (e.kind == EVENT_SLEEP) {
+      Serial.printf("[log] %9s  sleep      %-16s battery=%u mV\n", when, sleepName(e.detail), e.millivolts);
+    } else {
+      Serial.printf("[log] %9s  %-10s wake=%-11s battery=%u mV\n", when, resetName(e.kind),
+                    wakeName(e.detail), e.millivolts);
+    }
   }
 }
 
@@ -844,7 +866,8 @@ void setup() {
   client->setConnectTimeout(CONNECT_TIMEOUT_MS);
 
   prefs.begin(NVS_NAMESPACE, false);
-  recordBoot();
+  if (prefs.isKey("boots")) prefs.remove("boots");
+  recordEvent((uint8_t)esp_reset_reason(), (uint8_t)esp_sleep_get_wakeup_cause(), true);
   supportedEffects = prefs.getULong64(NVS_KEY_EFFECTS, ~0ULL);
   buildMenu();
   String mac = prefs.isKey(NVS_KEY_MAC) ? prefs.getString(NVS_KEY_MAC, "") : String();

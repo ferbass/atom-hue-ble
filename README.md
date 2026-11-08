@@ -134,10 +134,15 @@ capabilities characteristic (`0001`, entry `04`, a bitmask of effect ids).
   Then fix `HUE_SERVICE_UUID` and `HUE_ONOFF_UUID` at the top of `src/main.cpp`.
 
 - **The board seems dead on battery, or the battery drains fast.** Plug it into USB and open the
-  serial monitor. Every boot prints the last 16 boots, kept in flash so they survive power
-  loss: `deep sleep wake=...` means it slept and woke normally, `power on` means it had lost
-  power, and `brownout` means the battery sagged too low. The battery voltage is logged with
-  each one. On the CoreInk, hold PWR for a couple of seconds to start it from off.
+  serial monitor. Every boot prints the last 24 boots and sleeps, kept in flash so they survive
+  power loss: `deep sleep wake=...` means it slept and woke normally, `power on` means it had
+  lost power, and `brownout` means the battery sagged too low. Each entry has the battery
+  voltage and, on the CoreInk, a time from its RTC. On the CoreInk, hold PWR for a couple of
+  seconds to start it from off.
+- **CoreInk switches off as soon as it is unplugged.** Check the hardware before the firmware.
+  A CoreInk that cannot run on battery even with only GPIO12 (power hold) driven high has a
+  drained or worn battery, a loose battery connector, or a faulty hold circuit. Charge it for a
+  few hours first. The voltage readings on USB come from the charger, not the battery.
 
 ## How it works
 

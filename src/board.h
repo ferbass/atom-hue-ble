@@ -47,6 +47,8 @@ bool isPressed(size_t button);
 int wakeButton();
 // Battery voltage in millivolts, or 0 when the board cannot measure it.
 uint16_t batteryMillivolts();
+// Seconds from a clock that keeps running while the board is off, or 0 when there is none.
+uint32_t clockSeconds();
 void show(const View& view, uint32_t now);
 // Short visible acknowledgement that the normal light was saved.
 void confirmSaved();
