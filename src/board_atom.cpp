@@ -51,6 +51,8 @@ bool isPressed(size_t button) { return digitalRead(BUTTONS[button].pin) == LOW; 
 
 int wakeButton() { return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 ? 0 : -1; }
 
+uint16_t batteryMillivolts() { return 0; }
+
 void show(const View& view, uint32_t now) {
   switch (view.mode) {
     case Mode::Resetting:

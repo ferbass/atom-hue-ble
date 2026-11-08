@@ -133,6 +133,12 @@ capabilities characteristic (`0001`, entry `04`, a bitmask of effect ids).
 
   Then fix `HUE_SERVICE_UUID` and `HUE_ONOFF_UUID` at the top of `src/main.cpp`.
 
+- **The board seems dead on battery, or the battery drains fast.** Plug it into USB and open the
+  serial monitor. Every boot prints the last 16 boots, kept in flash so they survive power
+  loss: `deep sleep wake=...` means it slept and woke normally, `power on` means it had lost
+  power, and `brownout` means the battery sagged too low. The battery voltage is logged with
+  each one. On the CoreInk, hold PWR for a couple of seconds to start it from off.
+
 ## How it works
 
 The bulb exposes a light control service (`932c32bd-0000-47a2-835a-a8d455b859dd`). Its on/off

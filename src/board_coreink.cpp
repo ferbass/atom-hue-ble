@@ -151,6 +151,14 @@ static void render(Screen screen, const View& v, bool force) {
   M5.Display.endWrite();
 }
 
+// Runs before setup(). The CoreInk only stays on after a press of PWR once this pin is high,
+// so latching it this early shortens how long PWR has to be held to start from off.
+extern "C" void initVariant() {
+  gpio_hold_dis(POWER_HOLD_PIN);
+  pinMode(POWER_HOLD_PIN, OUTPUT);
+  digitalWrite(POWER_HOLD_PIN, HIGH);
+}
+
 namespace board {
 
 const char* const NAME = "CoreInk";
@@ -164,10 +172,6 @@ const ButtonDef BUTTONS[] = {
 const size_t BUTTON_COUNT = sizeof(BUTTONS) / sizeof(BUTTONS[0]);
 
 void begin() {
-  pinMode(POWER_HOLD_PIN, OUTPUT);
-  digitalWrite(POWER_HOLD_PIN, HIGH);
-  gpio_hold_dis(POWER_HOLD_PIN);
-
   auto cfg = M5.config();
   cfg.clear_display = false;
   cfg.output_power = false;
@@ -180,6 +184,8 @@ void begin() {
 
   for (size_t i = 0; i < BUTTON_COUNT; i++) pinMode(BUTTONS[i].pin, INPUT);
 }
+
+uint16_t batteryMillivolts() { return M5.Power.getBatteryVoltage(); }
 
 bool isPressed(size_t button) { return digitalRead(BUTTONS[button].pin) == LOW; }
 

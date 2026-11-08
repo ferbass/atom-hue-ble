@@ -45,6 +45,8 @@ void begin();
 bool isPressed(size_t button);
 // Index of the button that woke the board from deep sleep, or -1.
 int wakeButton();
+// Battery voltage in millivolts, or 0 when the board cannot measure it.
+uint16_t batteryMillivolts();
 void show(const View& view, uint32_t now);
 // Short visible acknowledgement that the normal light was saved.
 void confirmSaved();

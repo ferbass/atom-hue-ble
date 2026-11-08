@@ -77,6 +77,16 @@ static const char* NVS_KEY_MAC   = "mac";
 static const char* NVS_KEY_TYPE  = "type";
 static const char* NVS_KEY_NORMAL = "normal";
 static const char* NVS_KEY_EFFECTS = "effects";
+static const char* NVS_KEY_BOOTS   = "boots";
+static const size_t BOOT_HISTORY   = 16;
+
+// Kept in flash so it survives the board losing power: tells whether the board woke from deep
+// sleep or had switched off, and what the battery looked like each time.
+struct BootRecord {
+  uint8_t reset;
+  uint8_t wake;
+  uint16_t millivolts;
+};
 
 enum class State { Scanning, Connecting, Securing, Ready, Disconnecting, WaitRetry, Resetting };
 
@@ -753,6 +763,51 @@ static Mode currentMode() {
   }
 }
 
+static const char* resetName(uint8_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power on";
+    case ESP_RST_EXT: return "reset pin";
+    case ESP_RST_SW: return "restart";
+    case ESP_RST_PANIC: return "crash";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    default: return "unknown";
+  }
+}
+
+static const char* wakeName(uint8_t cause) {
+  switch (cause) {
+    case ESP_SLEEP_WAKEUP_EXT0: return board::BUTTONS[0].name;
+    case ESP_SLEEP_WAKEUP_EXT1: return board::BUTTON_COUNT > 1 ? board::BUTTONS[1].name : "ext1";
+    case ESP_SLEEP_WAKEUP_UNDEFINED: return "-";
+    default: return "other";
+  }
+}
+
+static void recordBoot() {
+  BootRecord history[BOOT_HISTORY] = {};
+  size_t count = 0;
+  if (prefs.isKey(NVS_KEY_BOOTS)) {
+    count = prefs.getBytes(NVS_KEY_BOOTS, history, sizeof(history)) / sizeof(BootRecord);
+  }
+  if (count == BOOT_HISTORY) {
+    memmove(history, history + 1, sizeof(BootRecord) * (BOOT_HISTORY - 1));
+    count--;
+  }
+  history[count++] = {(uint8_t)esp_reset_reason(), (uint8_t)esp_sleep_get_wakeup_cause(),
+                      board::batteryMillivolts()};
+  prefs.putBytes(NVS_KEY_BOOTS, history, count * sizeof(BootRecord));
+
+  Serial.println("[boot] history, oldest first:");
+  for (size_t i = 0; i < count; i++) {
+    Serial.printf("[boot]   %-10s wake=%-12s battery=%u mV\n", resetName(history[i].reset),
+                  wakeName(history[i].wake), history[i].millivolts);
+  }
+}
+
 static View currentView() {
   View v = {};
   v.mode = currentMode();
@@ -789,6 +844,7 @@ void setup() {
   client->setConnectTimeout(CONNECT_TIMEOUT_MS);
 
   prefs.begin(NVS_NAMESPACE, false);
+  recordBoot();
   supportedEffects = prefs.getULong64(NVS_KEY_EFFECTS, ~0ULL);
   buildMenu();
   String mac = prefs.isKey(NVS_KEY_MAC) ? prefs.getString(NVS_KEY_MAC, "") : String();
