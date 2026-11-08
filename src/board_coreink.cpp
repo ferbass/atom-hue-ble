@@ -33,7 +33,10 @@ enum class Screen : uint8_t { Pairing, Connecting, Status, Menu, Resetting, Unre
 static const uint32_t NOTHING_SHOWN = 0xFFFFFFFF;
 static uint32_t shownSignature = NOTHING_SHOWN;
 static bool savedNote = false;
-static bool menuUsed = false;
+// Fast partial refreshes leave ghosting behind; a full refresh clears it but flashes.
+static const uint8_t FAST_REFRESH_LIMIT = 8;
+static uint8_t fastRefreshes = 0;
+static bool menuShown = false;
 static View lastView = {};
 static Mode lastMode = Mode::Connecting;
 static uint32_t modeSince = 0;
@@ -137,6 +140,13 @@ static void render(Screen screen, const View& v, bool force) {
   if (screen == Screen::Status && v.mode != Mode::Ready && !force) return;
   shownSignature = sig;
 
+  // Only menu scrolling uses fast refreshes, and every few of them get a full one.
+  bool full = screen != Screen::Menu || !menuShown || fastRefreshes >= FAST_REFRESH_LIMIT;
+  menuShown = screen == Screen::Menu;
+  M5.Display.waitDisplay();
+  M5.Display.setEpdMode(full ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
+  fastRefreshes = full ? 0 : fastRefreshes + 1;
+
   M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
   switch (screen) {
@@ -220,7 +230,6 @@ void begin() {
   holdPower();
   Serial.printf("[power] hold pin %s\n", powerHeld() ? "high" : "NOT HIGH");
   startClockIfStopped();
-  M5.Display.setEpdMode(epd_mode_t::epd_fast);
   M5.Display.setRotation(0);
 
   for (size_t i = 0; i < BUTTON_COUNT; i++) pinMode(BUTTONS[i].pin, INPUT);
@@ -258,7 +267,6 @@ void show(const View& view, uint32_t now) {
   }
   if (view.lightOn != lastView.lightOn || view.look != lastView.look) savedNote = false;
   lastView = view;
-  menuUsed |= view.menuOpen;
   render(pickScreen(view, now), view, false);
   if (view.mode == Mode::Resetting) M5.Display.waitDisplay();
 }
@@ -271,12 +279,10 @@ void confirmSaved() {
 void sleep(SleepReason reason) {
   if (reason == SleepReason::Unreachable) render(Screen::Unreachable, lastView, true);
   if (reason == SleepReason::PairingTimeout) render(Screen::PairingTimeout, lastView, true);
-  if (reason == SleepReason::Idle && lastView.mode == Mode::Ready && menuUsed) {
-    // Leave a clean status screen behind: the menu's fast partial refreshes leave ghosting.
+  if (reason == SleepReason::Idle && lastView.mode == Mode::Ready && (lastView.menuOpen || fastRefreshes)) {
+    // Leave a clean status screen behind while asleep.
     lastView.menuOpen = false;
     savedNote = false;
-    M5.Display.waitDisplay();
-    M5.Display.setEpdMode(epd_mode_t::epd_quality);
     render(Screen::Status, lastView, true);
   }
   M5.Display.waitDisplay();

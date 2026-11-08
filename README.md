@@ -83,8 +83,10 @@ CoreInk:
 
 Rolling the wheel does not wake the CoreInk, and neither does the top button: the ESP32 can
 only be woken from deep sleep by two of its buttons, the wheel press and the power button.
-The menu stays awake 15 seconds after the last input instead of 5. Before sleeping, the screen
-gets one full refresh to clear the ghosting left by the menu's fast updates.
+The menu stays awake 15 seconds after the last input instead of 5. Status changes use a full
+e-ink refresh, which flashes briefly but leaves no ghosting. Scrolling the menu uses fast
+partial refreshes, with a full one every 8 steps and another before sleep, so the screen left
+showing while asleep is always clean.
 
 A single click waits 350 ms to make sure it is not a double-click, before toggling. If the
 bulb is not connected, the action is queued and the connection is retried right away.
