@@ -93,18 +93,39 @@ ATOM LED colours (in low-power mode the LED is only lit while the board is awake
 
 ### Theme
 
-The theme is set at the top of `src/main.cpp`:
+The theme is set at the top of `src/main.cpp`. The default is candlelight:
 
 ```cpp
-static const Theme THEME = {144, 447, 0.0f, 0.0f};
+static const Theme THEME = {90, 454, 0.5381f, 0.4111f};
 ```
 
-The fields are brightness (1 to 254), white tone in mireds (153 cool to 454 warm), and CIE x/y
-for a colour. Use either mireds or x/y: set mireds to 0 to use the colour. The default is a warm
-dimmed white close to the Hue "Relax" scene. To copy a look you made in the Hue app, set it,
-close the app, flash the `debug-dump` build and read the values of `932c32bd-0003` (brightness),
-`932c32bd-0004` (mireds, little-endian) and `932c32bd-0005` (x then y, little-endian, scaled
-to 0xFFFF).
+The fields are brightness (1 to 254), a white tone in mireds, and CIE x/y for a colour. Colour
+bulbs use x/y. Bulbs without colour fall back to mireds, and 454 (about 2200 K) is the warmest
+they can do. Candlelight is about 1900 K, so only colour bulbs get the full effect.
+
+The Hue app's animated "Candle" effect cannot be reproduced this way: the firmware sets a
+still colour and brightness.
+
+#### Copying a look from the Hue app
+
+1. Set the look in the Hue app, then close the app so the bulb is free.
+2. Flash `debug-dump` and open the monitor:
+
+   ```bash
+   pio run -e debug-dump -t upload && pio device monitor
+   ```
+
+3. In the dump, read these values. All of them are little-endian.
+
+   | Characteristic | Meaning | Example `value=` | Decoded |
+   | --- | --- | --- | --- |
+   | `932c32bd-0003` | brightness | `5a` | 90 |
+   | `932c32bd-0004` | mireds | `c601` | 0x01c6 = 454 |
+   | `932c32bd-0005` | x, y | `c0893d69` | 0x89c0 / 65535 = 0.5381, 0x693d / 65535 = 0.4111 |
+
+4. Put the numbers in `THEME`, flash your normal build and double-click. The serial log shows
+   `[theme] colour x=... (raw ...)`. Flash `debug-dump` again and check that the raw bytes
+   match what the bulb reports.
 
 ## When it does not work
 

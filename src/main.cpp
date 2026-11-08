@@ -4,16 +4,17 @@
 
 #include "board.h"
 
-// The look applied by the theme gesture. For a white tone set `mireds` (153 = cool, 454 = warm)
-// and leave x/y at 0. For a colour set `mireds` to 0 and give CIE 1931 x/y coordinates.
-// Brightness is 1-254.
+// The look applied by the theme gesture. Colour bulbs use the CIE 1931 x/y coordinates;
+// bulbs without colour fall back to `mireds` (153 = cool, 454 = warmest a white bulb can do).
+// Set x/y to 0 to always use mireds. Brightness is 1-254.
 struct Theme {
   uint8_t brightness;
   uint16_t mireds;
   float x;
   float y;
 };
-static const Theme THEME = {144, 447, 0.0f, 0.0f};
+// Candlelight: about 1900 K at 35% brightness.
+static const Theme THEME = {90, 454, 0.5381f, 0.4111f};
 
 static const char* HUE_SERVICE_UUID    = "932c32bd-0000-47a2-835a-a8d455b859dd";
 static const char* HUE_ONOFF_UUID      = "932c32bd-0002-47a2-835a-a8d455b859dd";
@@ -304,14 +305,17 @@ static bool writeLook() {
     uint8_t bri = constrain(THEME.brightness, 1, 254);
     ok &= brightnessChr->writeValue(&bri, 1, true);
   }
-  if (THEME.mireds && miredsChr) {
-    uint8_t ct[2] = {(uint8_t)(THEME.mireds & 0xFF), (uint8_t)(THEME.mireds >> 8)};
-    ok &= miredsChr->writeValue(ct, sizeof(ct), true);
-  } else if (!THEME.mireds && xyChr) {
+  if (THEME.x > 0 && THEME.y > 0 && xyChr) {
     uint16_t x = (uint16_t)(constrain(THEME.x, 0.0f, 1.0f) * 0xFFFF);
     uint16_t y = (uint16_t)(constrain(THEME.y, 0.0f, 1.0f) * 0xFFFF);
     uint8_t xy[4] = {(uint8_t)(x & 0xFF), (uint8_t)(x >> 8), (uint8_t)(y & 0xFF), (uint8_t)(y >> 8)};
+    Serial.printf("[theme] colour x=%.4f y=%.4f (raw %02x%02x%02x%02x)\n", THEME.x, THEME.y, xy[0],
+                  xy[1], xy[2], xy[3]);
     ok &= xyChr->writeValue(xy, sizeof(xy), true);
+  } else if (THEME.mireds && miredsChr) {
+    uint8_t ct[2] = {(uint8_t)(THEME.mireds & 0xFF), (uint8_t)(THEME.mireds >> 8)};
+    Serial.printf("[theme] white tone %u mireds (raw %02x%02x)\n", THEME.mireds, ct[0], ct[1]);
+    ok &= miredsChr->writeValue(ct, sizeof(ct), true);
   }
   return ok;
 }
