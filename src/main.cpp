@@ -1,18 +1,40 @@
-#include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 
-static const char* HUE_SERVICE_UUID = "932c32bd-0000-47a2-835a-a8d455b859dd";
-static const char* HUE_ONOFF_UUID   = "932c32bd-0002-47a2-835a-a8d455b859dd";
+#include "board.h"
+
+// Looks are written to the bulb's combined state characteristic (0007) as a list of
+// [type, length, value...] entries, the format HueBLE (github.com/flip-dots/HueBLE) documents:
+// 01 power, 02 brightness (1-254), 03 mireds (LE), 04 CIE x/y (LE, scaled to 0xFFFF),
+// 05 transition (LE, 100 ms units), 06 effect (01 candle, 02 fireplace, ...), 08 effect speed.
+static const uint8_t TLV_POWER        = 0x01;
+static const uint8_t TLV_EFFECT       = 0x06;
+static const uint8_t TLV_EFFECT_SPEED = 0x08;
+
+// Steady 2730 K at full brightness. Holding the button 2 s replaces it with the current look.
+static const uint8_t DEFAULT_NORMAL[] = {0x01, 0x01, 0x01, 0x02, 0x01, 0xfe, 0x03, 0x02, 0x6e, 0x01};
+// The Hue app's Candle effect, captured from an LCA002 bulb.
+static const uint8_t CANDLE[] = {0x01, 0x01, 0x01, 0x02, 0x01, 0x42, 0x04, 0x04, 0x70,
+                                 0x7d, 0xf5, 0x68, 0x06, 0x01, 0x01, 0x08, 0x01, 0x80};
+static const size_t MAX_LOOK_LEN = 32;
+
+static const char* HUE_SERVICE_UUID    = "932c32bd-0000-47a2-835a-a8d455b859dd";
+static const char* HUE_ONOFF_UUID      = "932c32bd-0002-47a2-835a-a8d455b859dd";
+static const char* HUE_STATE_UUID      = "932c32bd-0007-47a2-835a-a8d455b859dd";
 // Hue bulbs usually advertise only this 16-bit Signify UUID, not the 128-bit light service.
 static const uint16_t HUE_ADV_UUID16 = 0xFE0F;
-static const char* HUE_NAME_HINT    = "Hue";
+static const char* HUE_NAME_HINT     = "Hue";
 
-static const uint8_t BUTTON_PIN = 39;
-static const uint8_t LED_PIN    = 27;
+#ifdef LOW_POWER
+static constexpr bool LOW_POWER_MODE = true;
+#else
+static constexpr bool LOW_POWER_MODE = false;
+#endif
 
 static const uint32_t DEBOUNCE_MS        = 50;
+static const uint32_t DOUBLE_CLICK_MS    = 350;
+static const uint32_t SAVE_HOLD_MS       = 2000;
 static const uint32_t RESET_HOLD_MS      = 5000;
 static const uint32_t RESET_FLASH_MS     = 1500;
 static const uint32_t SCAN_WINDOW_MS     = 5000;
@@ -20,25 +42,23 @@ static const uint32_t CONNECT_TIMEOUT_MS = 10000;
 static const uint32_t SECURE_TIMEOUT_MS  = 15000;
 static const uint32_t RETRY_MIN_MS       = 2000;
 static const uint32_t RETRY_MAX_MS       = 30000;
-static const uint32_t BLINK_MS           = 400;
-static const uint32_t FAST_BLINK_MS      = 120;
+static const uint32_t ACTION_MAX_AGE_MS  = 15000;
+static const uint32_t LOOP_DELAY_MS      = 5;
 
-static const uint8_t LED_BRIGHTNESS = 40;
-static const uint32_t COLOR_ON = Adafruit_NeoPixel::Color(255, 170, 80);
-static const uint32_t COLOR_OFF = Adafruit_NeoPixel::Color(160, 0, 0);
-static const uint32_t COLOR_PAIRING = Adafruit_NeoPixel::Color(0, 0, 255);
-static const uint32_t COLOR_RECONNECT = Adafruit_NeoPixel::Color(255, 160, 0);
-static const uint32_t COLOR_RESET = Adafruit_NeoPixel::Color(180, 0, 255);
+// Low-power mode only.
+static const uint32_t IDLE_SLEEP_MS       = 5000;
+static const uint32_t CONNECT_GIVE_UP_MS  = 25000;
+static const uint32_t PAIRING_TIMEOUT_MS  = 180000;
+static const uint32_t DISCONNECT_WAIT_MS  = 1000;
+static const uint32_t LOW_POWER_CPU_MHZ   = 80;
 
 static const char* NVS_NAMESPACE = "hue";
 static const char* NVS_KEY_MAC   = "mac";
 static const char* NVS_KEY_TYPE  = "type";
+static const char* NVS_KEY_NORMAL = "normal";
 
 enum class State { Scanning, Connecting, Securing, Ready, Disconnecting, WaitRetry, Resetting };
 
-static const uint32_t COLOR_BLACK = 0;
-static Adafruit_NeoPixel led(1, LED_PIN, NEO_GRB + NEO_KHZ800);
-static uint32_t shownColor = COLOR_BLACK;
 static Preferences prefs;
 
 static State state = State::WaitRetry;
@@ -46,9 +66,14 @@ static uint32_t stateSince = 0;
 static uint32_t nextAttemptAt = 0;
 static uint32_t retryDelay = RETRY_MIN_MS;
 static bool pairingMode = false;
+static uint32_t lastActivityAt = 0;
+
+static Action pendingAction = Action::None;
+static uint32_t pendingSince = 0;
 
 static NimBLEClient* client = nullptr;
 static NimBLERemoteCharacteristic* onOffChr = nullptr;
+static NimBLERemoteCharacteristic* stateChr = nullptr;
 static NimBLEAddress target;
 static NimBLEAddress candidate;
 static int candidateRssi = -128;
@@ -65,11 +90,18 @@ static volatile bool authEncrypted = false;
 static volatile bool authBonded = false;
 static volatile int lastReason = 0;
 
-static bool btnRaw = false;
-static bool btnStable = false;
-static bool btnLongFired = false;
-static uint32_t btnChangedAt = 0;
-static uint32_t btnPressedAt = 0;
+struct ButtonState {
+  bool raw;
+  bool stable;
+  bool holdFired;
+  uint8_t clicks;
+  uint32_t changedAt;
+  uint32_t pressedAt;
+  uint32_t releasedAt;
+};
+
+static const size_t MAX_BUTTONS = 4;
+static ButtonState buttons[MAX_BUTTONS];
 
 static void setState(State s) {
   state = s;
@@ -146,11 +178,15 @@ static void startScan() {
   }
 }
 
+static void clearCharacteristics() {
+  onOffChr = stateChr = nullptr;
+}
+
 static void scheduleRetry() {
-  onOffChr = nullptr;
+  clearCharacteristics();
   nextAttemptAt = millis() + retryDelay;
   Serial.printf("[ble] retrying in %lu ms\n", (unsigned long)retryDelay);
-  if (!pairingMode) retryDelay = min(retryDelay * 2, RETRY_MAX_MS);
+  if (!pairingMode && !LOW_POWER_MODE) retryDelay = min(retryDelay * 2, RETRY_MAX_MS);
   setState(State::WaitRetry);
 }
 
@@ -221,11 +257,13 @@ static bool setupGatt() {
     Serial.println("[gatt] ERROR: on/off characteristic not found (build env 'debug-dump' to inspect)");
     return false;
   }
+  stateChr = svc->getCharacteristic(HUE_STATE_UUID);
+  if (!stateChr) Serial.println("[gatt] no combined state characteristic: only on/off is available");
 
   NimBLEAttValue v = onOffChr->readValue();
   if (v.size() < 1) {
     Serial.println("[gatt] ERROR: could not read on/off state (not bonded, or bulb rejected us)");
-    onOffChr = nullptr;
+    clearCharacteristics();
     return false;
   }
   lightOn = v.data()[0] != 0;
@@ -246,20 +284,105 @@ static void saveTarget() {
   Serial.printf("[nvs] saved bulb %s\n", target.toString().c_str());
 }
 
+static bool setPower(bool on) {
+  uint8_t value = on ? 0x01 : 0x00;
+  Serial.printf("[gatt] turning %s\n", on ? "ON" : "OFF");
+  if (!onOffChr->writeValue(&value, 1, true)) {
+    Serial.println("[gatt] ERROR: on/off write failed");
+    return false;
+  }
+  lightOn = on;
+  return true;
+}
+
+static void printHex(const char* label, const uint8_t* data, size_t len) {
+  Serial.print(label);
+  for (size_t i = 0; i < len; i++) Serial.printf("%02x", data[i]);
+  Serial.println();
+}
+
+static bool writeLook(const char* name, const uint8_t* look, size_t len) {
+  Serial.printf("[look] %s: ", name);
+  printHex("", look, len);
+  if (!stateChr->writeValue(look, len, true)) {
+    Serial.println("[look] ERROR: bulb rejected the look");
+    return false;
+  }
+  lightOn = true;
+  return true;
+}
+
+static void turnOnNormal() {
+  uint8_t look[MAX_LOOK_LEN];
+  size_t n = prefs.isKey(NVS_KEY_NORMAL) ? prefs.getBytes(NVS_KEY_NORMAL, look, sizeof(look)) : 0;
+  if (n == 0) {
+    memcpy(look, DEFAULT_NORMAL, sizeof(DEFAULT_NORMAL));
+    n = sizeof(DEFAULT_NORMAL);
+  }
+  writeLook("normal", look, n);
+}
+
 static void toggleLight() {
-  if (!onOffChr) return;
-  uint8_t value = lightOn ? 0x00 : 0x01;
-  Serial.printf("[gatt] writing 0x%02x (turn %s)\n", value, value ? "ON" : "OFF");
-  if (onOffChr->writeValue(&value, 1, true)) {
-    lightOn = value != 0;
-    Serial.println("[gatt] write ok");
+  if (lightOn || !stateChr) {
+    setPower(!lightOn);
   } else {
-    Serial.println("[gatt] ERROR: write failed");
+    turnOnNormal();
+  }
+}
+
+static void applyCandle() {
+  if (stateChr) writeLook("candle", CANDLE, sizeof(CANDLE));
+}
+
+// Copies a state snapshot with power forced on and effects removed, so the normal light is
+// always steady. Returns 0 if the snapshot is malformed or too long.
+static size_t buildNormal(const uint8_t* src, size_t len, uint8_t* out) {
+  size_t n = 0;
+  out[n++] = TLV_POWER;
+  out[n++] = 1;
+  out[n++] = 1;
+  for (size_t i = 0; i < len;) {
+    if (i + 2 > len) return 0;
+    uint8_t type = src[i];
+    size_t entry = 2 + src[i + 1];
+    if (i + entry > len) return 0;
+    if (type != TLV_POWER && type != TLV_EFFECT && type != TLV_EFFECT_SPEED) {
+      if (n + entry > MAX_LOOK_LEN) return 0;
+      memcpy(out + n, src + i, entry);
+      n += entry;
+    }
+    i += entry;
+  }
+  return n;
+}
+
+static void saveNormal() {
+  if (!stateChr) return;
+  NimBLEAttValue v = stateChr->readValue();
+  uint8_t look[MAX_LOOK_LEN];
+  size_t n = buildNormal(v.data(), v.size(), look);
+  if (v.size() == 0 || n <= 3) {
+    printHex("[look] ERROR: could not read a usable state: ", v.data(), v.size());
+    return;
+  }
+  prefs.putBytes(NVS_KEY_NORMAL, look, n);
+  printHex("[look] saved normal: ", look, n);
+  board::confirmSaved();
+}
+
+static void runAction(Action action) {
+  lastActivityAt = millis();
+  switch (action) {
+    case Action::Toggle: toggleLight(); break;
+    case Action::Candle: applyCandle(); break;
+    case Action::SaveNormal: saveNormal(); break;
+    default: break;
   }
 }
 
 static void beginReset() {
   Serial.println("[reset] long press: clearing saved bulb and all bonds");
+  pendingAction = Action::None;
   prefs.clear();
   NimBLEDevice::getScan()->stop();
   if (client->isConnected()) client->disconnect();
@@ -267,40 +390,101 @@ static void beginReset() {
   setState(State::Resetting);
 }
 
-static void onButtonPress() {
-  switch (state) {
-    case State::Ready:
-      toggleLight();
-      break;
-    case State::WaitRetry:
-      Serial.println("[btn] press while disconnected: reconnecting now");
-      retryDelay = RETRY_MIN_MS;
-      startAttempt();
-      break;
-    default:
-      Serial.println("[btn] press ignored: connection in progress");
-      break;
+static void requestAction(Action action) {
+  if (action == Action::None) return;
+  if (action == Action::Reset) {
+    beginReset();
+    return;
+  }
+  if (state == State::Ready) {
+    runAction(action);
+    return;
+  }
+  if (!pairingMode) {
+    pendingAction = action;
+    pendingSince = millis();
+    Serial.println("[btn] not connected yet: action queued");
+  }
+  if (state == State::WaitRetry) {
+    Serial.println("[btn] reconnecting now");
+    retryDelay = RETRY_MIN_MS;
+    startAttempt();
   }
 }
 
-static void handleButton(uint32_t now) {
-  bool raw = digitalRead(BUTTON_PIN) == LOW;
-  if (raw != btnRaw) {
-    btnRaw = raw;
-    btnChangedAt = now;
+static void runPendingAction() {
+  Action action = pendingAction;
+  pendingAction = Action::None;
+  if (action != Action::None && millis() - pendingSince <= ACTION_MAX_AGE_MS) runAction(action);
+}
+
+static void initButtons(uint32_t now) {
+  int woke = board::wakeButton();
+  for (size_t i = 0; i < board::BUTTON_COUNT; i++) {
+    ButtonState& b = buttons[i];
+    b = ButtonState{};
+    b.raw = b.stable = board::isPressed(i);
+    b.changedAt = b.pressedAt = b.releasedAt = now;
+    // The press that woke us happened before boot. If it is already released, count it.
+    if ((int)i == woke && !b.stable) b.clicks = 1;
   }
-  if (raw != btnStable && now - btnChangedAt >= DEBOUNCE_MS) {
-    btnStable = raw;
-    if (btnStable) {
-      btnPressedAt = now;
-      btnLongFired = false;
-      onButtonPress();
+  if (woke >= 0) {
+    Serial.printf("[btn] woken by %s\n", board::BUTTONS[woke].name);
+    lastActivityAt = now;
+  }
+}
+
+static void handleButton(size_t i, uint32_t now) {
+  const ButtonDef& def = board::BUTTONS[i];
+  ButtonState& b = buttons[i];
+
+  bool raw = board::isPressed(i);
+  if (raw != b.raw) {
+    b.raw = raw;
+    b.changedAt = now;
+  }
+  if (raw != b.stable && now - b.changedAt >= DEBOUNCE_MS) {
+    b.stable = raw;
+    lastActivityAt = now;
+    if (b.stable) {
+      b.pressedAt = now;
+      b.holdFired = false;
+    } else if (!b.holdFired && now - b.pressedAt >= SAVE_HOLD_MS && def.longPress != Action::None) {
+      b.clicks = 0;
+      Serial.printf("[btn] %s long press\n", def.name);
+      requestAction(def.longPress);
+    } else if (!b.holdFired) {
+      b.clicks++;
+      b.releasedAt = now;
     }
   }
-  if (btnStable && !btnLongFired && now - btnPressedAt >= RESET_HOLD_MS) {
-    btnLongFired = true;
-    beginReset();
+
+  if (b.stable && !b.holdFired && def.hold != Action::None && now - b.pressedAt >= RESET_HOLD_MS) {
+    b.holdFired = true;
+    b.clicks = 0;
+    requestAction(def.hold);
+    return;
   }
+
+  if (b.stable || b.clicks == 0) return;
+  if (def.doubleClick == Action::None) {
+    b.clicks = 0;
+    requestAction(def.click);
+  } else if (b.clicks >= 2) {
+    b.clicks = 0;
+    Serial.printf("[btn] %s double click\n", def.name);
+    requestAction(def.doubleClick);
+  } else if (now - b.releasedAt >= DOUBLE_CLICK_MS) {
+    b.clicks = 0;
+    requestAction(def.click);
+  }
+}
+
+static bool buttonsIdle() {
+  for (size_t i = 0; i < board::BUTTON_COUNT; i++) {
+    if (buttons[i].stable || buttons[i].clicks) return false;
+  }
+  return true;
 }
 
 static void handleBleEvents() {
@@ -361,8 +545,10 @@ static void handleBleEvents() {
           pairingMode = false;
         }
         retryDelay = RETRY_MIN_MS;
+        lastActivityAt = millis();
         Serial.println("[ble] ready - press the button to toggle");
         setState(State::Ready);
+        runPendingAction();
       } else {
         failAndRetry();
       }
@@ -402,31 +588,48 @@ static void handleTimers() {
   }
 }
 
-static void updateLed(uint32_t now) {
-  uint32_t color;
-  if (state == State::Resetting) {
-    color = (now / FAST_BLINK_MS) % 2 ? COLOR_RESET : COLOR_BLACK;
-  } else if (state == State::Ready) {
-    color = lightOn ? COLOR_ON : COLOR_OFF;
-  } else {
-    color = (now / BLINK_MS) % 2 ? (pairingMode ? COLOR_PAIRING : COLOR_RECONNECT) : COLOR_BLACK;
+static void goToSleep(SleepReason reason) {
+  Serial.printf("[power] going to sleep (%s)\n", reason == SleepReason::Idle          ? "idle"
+                                                 : reason == SleepReason::Unreachable ? "bulb unreachable"
+                                                                                      : "pairing timed out");
+  NimBLEDevice::getScan()->stop();
+  if (client->isConnected() && client->disconnect()) {
+    uint32_t start = millis();
+    while (client->isConnected() && millis() - start < DISCONNECT_WAIT_MS) delay(10);
   }
-  if (color != shownColor) {
-    shownColor = color;
-    led.setPixelColor(0, color);
-    led.show();
+  Serial.flush();
+  board::sleep(reason);
+}
+
+static void handlePower() {
+  if (!LOW_POWER_MODE || state == State::Resetting || !buttonsIdle()) return;
+  uint32_t idle = millis() - lastActivityAt;
+  if (state == State::Ready) {
+    if (idle >= IDLE_SLEEP_MS) goToSleep(SleepReason::Idle);
+  } else if (pairingMode) {
+    if (idle >= PAIRING_TIMEOUT_MS) goToSleep(SleepReason::PairingTimeout);
+  } else if (idle >= CONNECT_GIVE_UP_MS) {
+    goToSleep(SleepReason::Unreachable);
+  }
+}
+
+static Mode currentMode() {
+  switch (state) {
+    case State::Ready: return Mode::Ready;
+    case State::Resetting: return Mode::Resetting;
+    default: return pairingMode ? Mode::Pairing : Mode::Connecting;
   }
 }
 
 void setup() {
+  uint32_t now = millis();
+  if (LOW_POWER_MODE) setCpuFrequencyMhz(LOW_POWER_CPU_MHZ);
   Serial.begin(115200);
-  pinMode(BUTTON_PIN, INPUT);
+  board::begin();
+  initButtons(now);
+  lastActivityAt = now;
 
-  led.begin();
-  led.setBrightness(LED_BRIGHTNESS);
-  led.show();
-
-  Serial.println("\nATOM Lite -> Hue BLE toggle");
+  Serial.printf("\n%s -> Hue BLE toggle%s\n", board::NAME, LOW_POWER_MODE ? " (low power)" : "");
 #ifdef HUE_DEBUG_DUMP
   Serial.println("[dump] debug build: GATT table is dumped after every connect");
 #endif
@@ -457,8 +660,10 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
-  handleButton(now);
+  for (size_t i = 0; i < board::BUTTON_COUNT; i++) handleButton(i, now);
   handleBleEvents();
   handleTimers();
-  updateLed(now);
+  handlePower();
+  board::show(currentMode(), lightOn, now);
+  delay(LOOP_DELAY_MS);
 }
